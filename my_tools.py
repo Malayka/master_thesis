@@ -207,8 +207,6 @@ def getFlowAndIncomeVolumeForOneBlock(block, map_address2cluster):
     balance_deltas = collections.defaultdict(lambda: 0)
 
     for out in block.outputs:
-        if out.address.type == blocksci.address_type.nulldata:
-            continue
         if out.tx.is_coinbase:
             cluster_idx = 'income'
         else:
@@ -222,8 +220,10 @@ def getFlowAndIncomeVolumeForOneBlock(block, map_address2cluster):
         cluster_idx = map_address2cluster[add.type][add.address_num]
         balance_deltas[cluster_idx] -= in_.value
     
+    balance_deltas['fee'] = block.fee
     income = balance_deltas['income']
     flow = sum([abs(delta) for delta in balance_deltas.values()]) - income
+
     return flow, income
 
 class getFlowAndIncomeVolumeForOneBlock_classEdition:
@@ -231,6 +231,21 @@ class getFlowAndIncomeVolumeForOneBlock_classEdition:
         self.map_address2cluster = map_address2cluster
     def DO_IT(self, block):
         return getFlowAndIncomeVolumeForOneBlock(block, self.map_address2cluster)
+
+def getFlowAndIncomeVolume(chain, map_address2cluster, interval, max_block=None):
+    if max_block is None:
+        max_block = len(chain)
+    helper = getFlowAndIncomeVolumeForOneBlock_classEdition(map_address2cluster)
+    #flow_income_pairs = chain.map_blocks(helper.DO_IT, end=max_block)
+    flow_income_pairs = [helper.DO_IT(b) for b in chain[:max_block]]
+    
+    flows = []
+    incomes = []
+    for i in range(0, max_block, interval):
+        each_block_flows_incomes = list(zip(*flow_income_pairs[i: i + interval]))
+        flows.append(sum(each_block_flows_incomes[0]))
+        incomes.append(sum(each_block_flows_incomes[1]))
+    return flows, incomes
 
 def getFlowAndIncomeVolumePar(chain, map_address2cluster, interval, max_block=None):
     if max_block is None:
@@ -269,6 +284,20 @@ def checkFlowSum2(blocks):
             flowSum -= in_.value
         flowSum += b.fee
     return flowSum
+
+def meanDfColumns(pd_df, col_win_dict):
+    result_df_dict = {}
+    max_window = max(col_win_dict.values())
+    first_pos = max_window // 2
+    result_len = pd_df.shape[0] - max_window + 1
+    for col in col_win_dict:
+        window = col_win_dict[col]
+        if window > 1:
+            col_after_rolling = pd.rolling_mean(pd_df[col], window=window, center=True)
+        else:
+            col_after_rolling = pd_df[col]
+        result_df_dict[col] = col_after_rolling[first_pos: first_pos + result_len]
+    return pd.DataFrame(result_df_dict)
 
 # Q_SAVE_READ
 import json
@@ -490,14 +519,17 @@ class CoinDataMgr:
         if key == 'par':
             flows, incomes = getFlowAndIncomeVolumePar(self.chain, self.d[S_MAP_A2C].v['np'],
                 self.group_size, max_block=len(self.blocks))
-            data = {'flows' : flows, 'incomes': incomes}
+        elif key == 'nonPar':
+            flows, incomes = getFlowAndIncomeVolume(self.chain, self.d[S_MAP_A2C].v['np'],
+                self.group_size, max_block=len(self.blocks))
+        data = {'flows' : flows, 'incomes': incomes}
         self.d[S_FLOWS_INCOMES].add(key, data)
         
     @measure_time
     def getRelativeFlowVolumes(self, key='par'):
-        if key == 'par':
-            flows = self.d[S_FLOWS_INCOMES]['par']['flows']
-            incomes = self.d[S_FLOWS_INCOMES]['par']['incomes']
+        if key in ('par', 'nonPar'):
+            flows = self.d[S_FLOWS_INCOMES][key]['flows']
+            incomes = self.d[S_FLOWS_INCOMES][key]['incomes']
             data = getRelativeFlowVolumes(flows, incomes)
         self.d[S_REL_FLOWS].add(key, data)
         
@@ -518,10 +550,31 @@ class CoinDataMgr:
         print('Gathered under tag \'{}\''.format(tag))
 
         self.allMetrics.add(tag, pd.DataFrame(dict_for_pd_df))
+        return tag
+
+    def rollingMeanAllMetrics(self, allMetrics_tag, common_win=None, col_win_dict=None):
+        if not common_win is None:
+            tag_suffix = '_rolledMeanComWnd={}'.format(common_win)
+            result_col_win_dict = {}
+        if not col_win_dict is None:
+            tag_suffix = '_rolledMean_wnds:' + '_'.join(['{}={}'.format(k, v) for k, v in col_win_dict.items()])
+            result_col_win_dict = col_win_dict
+
+        to_be_rolled = self.allMetrics[allMetrics_tag]
+        for col in to_be_rolled.columns:
+            if col == 'times':
+                result_col_win_dict[col] = 1
+                continue
+            if col_win_dict is None:
+                result_col_win_dict[col] = common_win
+            elif not col in col_win_dict:
+                result_col_win_dict[col] = 1
+
+        self.allMetrics.add(allMetrics_tag + tag_suffix, meanDfColumns(to_be_rolled, result_col_win_dict))
+        return allMetrics_tag + tag_suffix
+
        
-    def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=(20, 15), begin=None, end=None):
-        f = plt.figure(figsize=figsize)
-        
+    def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None):
         dict_to_draw = {}
         if not metric_version_dict is None:
             for metric in metric_version_dict:
@@ -534,7 +587,10 @@ class CoinDataMgr:
                 if metric != 'times':
                     dict_to_draw[metric] = allMetrics_df[metric][begin:end]
                     
-        times = self.times[begin:end]
+        times = allMetrics_df['times'][begin:end]
+        if figsize is None:
+            figsize = (20, 6 * len(dict_to_draw))
+        f = plt.figure(figsize=figsize)
         axes = f.subplots(len(dict_to_draw), 1, sharex=True, squeeze=False)
         ind = 0
         for metric in dict_to_draw:

@@ -1,4 +1,5 @@
 *.hdf5
 calculated/litecoin/int1000b_map_address2cluster_new2
 calculated/litecoin/int1000b_map_address2cluster_new2.json
+calculated/bitcoin/allah_deltas_b.json
 __pycache__/*
