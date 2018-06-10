@@ -155,6 +155,35 @@ def getClustersBalanceChangeBlocksNp(blocks, map_address2cluster, cluster_balanc
     for b in blocks:
         cluster_balances_np = getClustersBalanceChangeNp(b, map_address2cluster, cluster_balances_np)
     return cluster_balances_np
+
+def getClustersBalanceChangeNp2(block, map_address2cluster_dict, cluster_balances_np):
+    fee_is_collected = True
+    if block.fee > 0:
+        miner = guessMinerAdds3((block,))[0]
+        if miner != UNKNOWN:
+            cluster_idx = map_address2cluster_dict[miner.type][miner.address_num]
+            cluster_balances_np[cluster_idx] += block.fee
+        else:
+            #print(UNKNOWN, 'block height: {}, value is {}'.format(block.height, block.fee))
+            fee_is_collected = False
+    for out in block.outputs:
+        add = out.address
+        cluster_idx = map_address2cluster_dict[add.type][add.address_num]
+        cluster_balances_np[cluster_idx] += out.value
+    for in_ in block.inputs:
+        add = in_.address
+        cluster_idx = map_address2cluster_dict[add.type][add.address_num]
+        cluster_balances_np[cluster_idx] -= in_.value
+    return cluster_balances_np, fee_is_collected
+
+def getClustersBalanceChangeBlocksNp2(blocks, map_address2cluster, cluster_balances_np):
+    print('Et ya2!')
+    bad_blocks = {}
+    for b in blocks:
+        cluster_balances_np, fee_is_collected = getClustersBalanceChangeNp2(b, map_address2cluster, cluster_balances_np)
+        if not fee_is_collected:
+            bad_blocks[str(b.height)] = b.fee
+    return cluster_balances_np, bad_blocks
     
 def getGinisOfClustersNp(blocks, map_address2cluster, interval):
     clusters_count = max(add2clustermap[1:].max() for add2clustermap in map_address2cluster.values()) + 1
@@ -170,6 +199,76 @@ def getGinisOfClustersNp(blocks, map_address2cluster, interval):
         ginis.append(my_gini(cluster_balances[cluster_balances.nonzero()]))
     return ginis
 
+
+
+
+#Q_REL_FLOWS
+def getFlowAndIncomeVolumeForOneBlock(block, map_address2cluster):
+    balance_deltas = collections.defaultdict(lambda: 0)
+
+    for out in block.outputs:
+        if out.address.type == blocksci.address_type.nulldata:
+            continue
+        if out.tx.is_coinbase:
+            cluster_idx = 'income'
+        else:
+            add = out.address
+            cluster_idx = map_address2cluster[add.type][add.address_num]
+        balance_deltas[cluster_idx] += out.value
+    for in_ in block.inputs:
+        #if in_.tx.is_coinbase:
+        #    continue
+        add = in_.address
+        cluster_idx = map_address2cluster[add.type][add.address_num]
+        balance_deltas[cluster_idx] -= in_.value
+    
+    income = balance_deltas['income']
+    flow = sum([abs(delta) for delta in balance_deltas.values()]) - income
+    return flow, income
+
+class getFlowAndIncomeVolumeForOneBlock_classEdition:
+    def __init__(self, map_address2cluster):
+        self.map_address2cluster = map_address2cluster
+    def DO_IT(self, block):
+        return getFlowAndIncomeVolumeForOneBlock(block, self.map_address2cluster)
+
+def getFlowAndIncomeVolumePar(chain, map_address2cluster, interval, max_block=None):
+    if max_block is None:
+        max_block = len(chain)
+    helper = getFlowAndIncomeVolumeForOneBlock_classEdition(map_address2cluster)
+    flow_income_pairs = chain.map_blocks(helper.DO_IT, end=max_block)
+    
+    flows = []
+    incomes = []
+    for i in range(0, max_block, interval):
+        each_block_flows_incomes = list(zip(*flow_income_pairs[i: i + interval]))
+        flows.append(sum(each_block_flows_incomes[0]))
+        incomes.append(sum(each_block_flows_incomes[1]))
+    return flows, incomes
+
+def getRelativeFlowVolumes(flows, incomes):
+    relativeFlowVolumes = []
+    total_income = 0
+    for i in range(len(flows)):
+        total_income += incomes[i]
+        relativeFlowVolumes.append(flows[i] / total_income)
+    return relativeFlowVolumes
+
+
+# Q_USEFUL
+def checkFlowSum2(blocks):
+    flowSum = 0
+    for b in blocks:
+        for out in b.outputs:
+            if out.tx.is_coinbase:
+                continue
+            flowSum += out.value
+        for in_ in b.inputs:
+            if in_.tx.is_coinbase:
+                continue
+            flowSum -= in_.value
+        flowSum += b.fee
+    return flowSum
 
 # Q_SAVE_READ
 import json
@@ -237,6 +336,9 @@ class DataVersions:
         self.default_save_function = default_save_function
         self.default_read_function = default_read_function
         
+    def __getitem__(self, key):
+        return self.v[key]
+
     def add(self, key, data, overwrite=False):
         if key in self.v:
             if overwrite:
@@ -304,6 +406,8 @@ S_ADDS_CNTS = 'activeAddressesCounts'
 S_MAP_A2C = 'map_address2cluster'
 S_CLS_CNTS = 'activeClustersCounts'
 S_GINIS = 'ginisOfClustersWealth'
+S_FLOWS_INCOMES = 'flowAndIncomeVolumes'
+S_REL_FLOWS = 'relativeFlowVolumes'
 
 import time
 def measure_time(f):
@@ -340,6 +444,8 @@ class CoinDataMgr:
                                                 default_read_function=readMapNpFromHdfs)
         self.d[S_CLS_CNTS] = DataVersions(self.files_prefix, S_CLS_CNTS)
         self.d[S_GINIS] = DataVersions(self.files_prefix, S_GINIS)
+        self.d[S_FLOWS_INCOMES] = DataVersions(self.files_prefix, S_FLOWS_INCOMES)
+        self.d[S_REL_FLOWS] = DataVersions(self.files_prefix, S_REL_FLOWS)
         self.allMetrics = DataVersions(self.files_prefix, 'allMetrics', default_save_function=saveCSV,
                                                                         default_read_function=readCSV)
         
@@ -370,15 +476,30 @@ class CoinDataMgr:
     @measure_time
     def getActiveClustersCounts(self, key='usingNpMap'):
         if key == 'usingNpMap':
-            map_add2cluster = self.d[S_MAP_A2C].v['np']
-            data = getActiveClustersCounts2Np(self.blocks, map_add2cluster, self.group_size)
+            data = getActiveClustersCounts2Np(self.blocks, self.d[S_MAP_A2C].v['np'], self.group_size)
         self.d[S_CLS_CNTS].add(key, data)
         
     @measure_time
     def getGinis(self, key='usingNpMap'):
         if key == 'usingNpMap':
-            map_add2cluster = self.d[S_MAP_A2C].v['np']
-            data = getGinisOfClustersNp(self.blocks, map_add2cluster, self.group_size)
+            data = getGinisOfClustersNp(self.blocks, self.d[S_MAP_A2C].v['np'], self.group_size)
+        self.d[S_GINIS].add(key, data)
+
+    @measure_time
+    def getFlowAndIncomeVolume(self, key='par'):
+        if key == 'par':
+            flows, incomes = getFlowAndIncomeVolumePar(self.chain, self.d[S_MAP_A2C].v['np'],
+                self.group_size, max_block=len(self.blocks))
+            data = {'flows' : flows, 'incomes': incomes}
+        self.d[S_FLOWS_INCOMES].add(key, data)
+        
+    @measure_time
+    def getRelativeFlowVolumes(self, key='par'):
+        if key == 'par':
+            flows = self.d[S_FLOWS_INCOMES]['par']['flows']
+            incomes = self.d[S_FLOWS_INCOMES]['par']['incomes']
+            data = getRelativeFlowVolumes(flows, incomes)
+        self.d[S_REL_FLOWS].add(key, data)
         
     def showDataAndVersions(self):
         for dataname in self.d:
