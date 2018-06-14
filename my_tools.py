@@ -553,7 +553,7 @@ class CoinDataMgr:
         
     @measure_time
     def getNCs(self):
-        NCs, self.egos = calcNakamotoCoef2(self.miners, self.group_size)
+        NCs, self.egos = calcNakamotoCoef2(self.d[S_MINERS][''], self.group_size)
         self.d[S_NCS].add('', NCs)
         
     @measure_time
