@@ -270,6 +270,54 @@ def getRelativeFlowVolumes(flows, incomes):
     return relativeFlowVolumes
 
 
+# Q_FEE_REVENUE
+def getFees(blocks, interval):
+    each_block_fees = [b.fee for b in blocks]
+    grouped_fees = []
+    for i in range(0, len(blocks), interval):
+        grouped_fees.append(sum(each_block_fees[i: i + interval]))
+    return grouped_fees
+
+def getFeesPar(chain, max_block, interval):
+    each_block_fees = chain.map_blocks(lambda b: b.fee, end=max_block)
+    grouped_fees = []
+    for i in range(0, max_block, interval):
+        grouped_fees.append(sum(each_block_fees[i: i + interval]))
+    return grouped_fees
+
+def getRevenues(blocks, interval):
+    each_block_revenues = [b.revenue for b in blocks]
+    grouped_revenues = []
+    for i in range(0, len(blocks), interval):
+        grouped_revenues.append(sum(each_block_revenues[i: i + interval]))
+    return grouped_revenues
+
+def getRevenuesPar(chain, max_block, interval):
+    each_block_revenues = chain.map_blocks(lambda b: b.revenue, end=max_block)
+    grouped_revenues = []
+    for i in range(0, max_block, interval):
+        grouped_revenues.append(sum(each_block_revenues[i: i + interval]))
+    return grouped_revenues
+
+
+#Q_UNSPENTS
+def calculateUnspent(block):
+    unspent = 0
+    for o in block.outputs:
+        if o.is_spent == False:
+            unspent += o.value
+    return unspent
+
+def getUnspentsByGroups(blocks, interval):
+    each_block_unspents = [calculateUnspent(b) for b in blocks]
+    return aggregateByGroups(each_block_unspents, interval)
+
+def getUnspentsByGroupsPar(chain, max_block, interval):
+    each_block_unspents = chain.map_blocks(calculateUnspent, end=max_block)
+    return aggregateByGroups(each_block_unspents, interval)
+
+
+
 # Q_USEFUL
 def checkFlowSum2(blocks):
     flowSum = 0
@@ -298,6 +346,14 @@ def meanDfColumns(pd_df, col_win_dict):
             col_after_rolling = pd_df[col]
         result_df_dict[col] = col_after_rolling[first_pos: first_pos + result_len]
     return pd.DataFrame(result_df_dict)
+
+
+def aggregateByGroups(values, interval, agg_function=sum):
+    aggregated = []
+    for i in range(0, len(values), interval):
+        aggregated.append(agg_function(values[i: i + interval]))
+    return aggregated
+
 
 # Q_SAVE_READ
 import json
@@ -339,10 +395,10 @@ def readMapNpFromHdfs(filename):
 
 import pandas as pd
 def saveCSV(pd_df, filename):
-    pd_df.to_csv(filename)
+    pd_df.to_csv(filename + '.csv', index=False)
     
 def readCSV(filename):
-    return pd.read_csv(filename)
+    return pd.read_csv(filename + '.csv')
 
 
 
@@ -437,6 +493,10 @@ S_CLS_CNTS = 'activeClustersCounts'
 S_GINIS = 'ginisOfClustersWealth'
 S_FLOWS_INCOMES = 'flowAndIncomeVolumes'
 S_REL_FLOWS = 'relativeFlowVolumes'
+S_FEES = 'fees'
+S_REVENUES = 'revenues'
+S_UNSPENTS = 'unspents'
+S_PRICES = 'prices'
 
 import time
 def measure_time(f):
@@ -475,8 +535,14 @@ class CoinDataMgr:
         self.d[S_GINIS] = DataVersions(self.files_prefix, S_GINIS)
         self.d[S_FLOWS_INCOMES] = DataVersions(self.files_prefix, S_FLOWS_INCOMES)
         self.d[S_REL_FLOWS] = DataVersions(self.files_prefix, S_REL_FLOWS)
+        self.d[S_FEES] = DataVersions(self.files_prefix, S_FEES)
+        self.d[S_REVENUES] = DataVersions(self.files_prefix, S_REVENUES)
+        self.d[S_UNSPENTS] = DataVersions(self.files_prefix, S_UNSPENTS)
         self.allMetrics = DataVersions(self.files_prefix, 'allMetrics', default_save_function=saveCSV,
                                                                         default_read_function=readCSV)
+
+        self.prices = DataVersions(self.files_prefix, 'prices', default_save_function=saveCSV,
+                                                                default_read_function=readCSV)
         
     def __getitem__(self, key):
         return self.d[key]
@@ -532,6 +598,39 @@ class CoinDataMgr:
             incomes = self.d[S_FLOWS_INCOMES][key]['incomes']
             data = getRelativeFlowVolumes(flows, incomes)
         self.d[S_REL_FLOWS].add(key, data)
+
+    @measure_time
+    def getFees(self, key='par'):
+        if key == 'par':
+            data = getFeesPar(self.chain, len(self.blocks), self.group_size)
+        elif key == 'nonPar':
+            data = getFees(self.blocks, self.group_size)
+        self.d[S_FEES].add(key, data)
+
+    @measure_time
+    def getRevenues(self, key='par'):
+        if key == 'par':
+            data = getRevenuesPar(self.chain, len(self.blocks), self.group_size)
+        elif key == 'nonPar':
+            data = getRevenues(self.blocks, self.group_size)
+        self.d[S_REVENUES].add(key, data)
+
+    @measure_time
+    def getUnspents(self, key='par', last_weeks_to_nan=12):
+        if key == 'par':
+            data = getUnspentsByGroupsPar(self.chain, len(self.blocks), self.group_size)
+        elif key == 'nonPar':
+            data = getUnspentsByGroups(self.blocks, self.group_size)
+
+        last_time_look_for = self.blocks[-1].time - datetime.timedelta(weeks=last_weeks_to_nan)
+        for height in range(len(self.blocks) - 1, -1, -1):
+            if self.blocks[height].time < last_time_look_for:
+                last_block = height // self.group_size
+                break
+        for height in range(last_block + 1, len(data)):
+            data[height] = None
+
+        self.d[S_UNSPENTS].add(key, data)
         
     def showDataAndVersions(self):
         for dataname in self.d:
@@ -574,29 +673,43 @@ class CoinDataMgr:
         return allMetrics_tag + tag_suffix
 
        
-    def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None):
+    def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None, price_key=None):
         dict_to_draw = {}
         if not metric_version_dict is None:
             for metric in metric_version_dict:
                 version = metric_version_dict[metric]
                 metric_and_version = metric + ('_' if version != '' else '') + version
                 dict_to_draw[metric_and_version] = self.d[metric].v[version][begin:end]
+            times = self.times[begin:end]
         else:
             allMetrics_df = self.allMetrics.v[allMetrics_tag]
             for metric in allMetrics_df.columns:
                 if metric != 'times':
                     dict_to_draw[metric] = allMetrics_df[metric][begin:end]
-                    
-        times = allMetrics_df['times'][begin:end]
+            times = allMetrics_df['times'][begin:end]
+
+        subplots_count =  len(dict_to_draw) + (0 if price_key is None else 1)    
         if figsize is None:
-            figsize = (20, 6 * len(dict_to_draw))
+            figsize = (20, 6 * subplots_count)
+        #plt.locator_params(axis='x', nbins=10)
         f = plt.figure(figsize=figsize)
-        axes = f.subplots(len(dict_to_draw), 1, sharex=True, squeeze=False)
+        axes = f.subplots(subplots_count, 1, sharex=True, squeeze=False)
+        #f.locator_params(axis='x', nbins=10)
         ind = 0
         for metric in dict_to_draw:
             axes[ind, 0].plot(times, dict_to_draw[metric])
             axes[ind, 0].set_title(metric)
             ind += 1
+        if not price_key is None:
+            axes[-1, 0].xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(10))
+
+            prices_df_00 = self.prices[price_key]
+            prices_df_0 = prices_df_00[pd.to_datetime(prices_df_00['times']) >= self.times[begin:][0]]
+            prices_df =   prices_df_0 [pd.to_datetime(prices_df_0 ['times']) <= self.times[:end][-1]]
+
+            axes[-1, 0].plot(pd.to_datetime(prices_df['times']), prices_df['prices'])
+            axes[-1, 0].set_title('prices from {}'.format(price_key))
+
         #axes[4].plot(pd.to_datetime(prices_half_b_df['snapped_at'])[b:e], prices_half_b_df['price'][b:e])
         #axes[4].set_title("Price (USD)")
         return f
