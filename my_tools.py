@@ -202,6 +202,100 @@ def getGinisOfClustersNp(blocks, map_address2cluster, interval):
 
 
 
+def my_zero():
+    return 0
+
+def getClustersBalanceChangeDict(block, map_address2cluster_dict):
+    balance_deltas = collections.defaultdict(my_zero)
+    fee_is_collected = True
+    if block.fee > 0:
+        miner = guessMinerAdds3((block,))[0]
+        if miner != UNKNOWN:
+            cluster_idx = map_address2cluster_dict[miner.type][miner.address_num]
+            balance_deltas[cluster_idx] += block.fee
+        else:
+            #print(UNKNOWN, 'block height: {}, value is {}'.format(block.height, block.fee))
+            fee_is_collected = False
+    for out in block.outputs:
+        add = out.address
+        cluster_idx = map_address2cluster_dict[add.type][add.address_num]
+        balance_deltas[cluster_idx] += out.value
+    for in_ in block.inputs:
+        add = in_.address
+        cluster_idx = map_address2cluster_dict[add.type][add.address_num]
+        balance_deltas[cluster_idx] -= in_.value
+    return balance_deltas#, fee_is_collected
+
+class getClustersBalanceChangeDict_classEdition:
+    def __init__(self, map_address2cluster):
+        self.map_address2cluster = map_address2cluster
+    def DO_IT(self, block):
+        return getClustersBalanceChangeDict(block, self.map_address2cluster)
+
+def sumClusterDicts(balance_change_dicts):
+    result_dict = balance_change_dicts[0]
+    for bcd in balance_change_dicts[1:]:
+        for cl_idx in bcd:
+            result_dict[cl_idx] += bcd[cl_idx]
+    return result_dict
+
+def getClustersBalanceChangeByGroupsPar(chain, max_block, map_address2cluster, interval):
+    helper = getClustersBalanceChangeDict_classEdition(map_address2cluster)
+    balance_change_dicts = chain.map_blocks(helper.DO_IT, end=max_block)
+    return aggregateByGroups(balance_change_dicts, interval, agg_function=sumClusterDicts)
+
+def getClustersBalanceChangeByGroupsNonPar(chain, max_block, map_address2cluster, interval):
+    balance_change_dicts = [getClustersBalanceChangeDict(b, map_address2cluster) for b in chain[:max_block]]        
+    return aggregateByGroups(balance_change_dicts, interval, agg_function=sumClusterDicts)
+
+def getNonEmptyClustersCountsSoFar(chain, max_blocks, map_address2cluster, interval, clusters_count, parrallel=True):
+    if parrallel:
+        balance_change_dicts = getClustersBalanceChangeByGroupsPar(chain, max_blocks, map_address2cluster, interval)
+    else:
+        balance_change_dicts = getClustersBalanceChangeByGroupsNonPar(chain, max_blocks, map_address2cluster, interval)
+
+    nonEmptyClustersCountSoFar = []
+    clusters_balances_np = np.zeros(clusters_count)
+    for bcd in balance_change_dicts:
+        for cl_idx in bcd:
+            clusters_balances_np[cl_idx] += bcd[cl_idx]
+        nonEmptyClustersCountSoFar.append(len(np.nonzero(clusters_balances_np)[0]))
+    return nonEmptyClustersCountSoFar
+
+
+
+
+
+def getClustersBalanceChangeBlocksPar(chain, start, end, map_address2cluster, cluster_balances_np):
+    helper = getClustersBalanceChangeDict_classEdition(map_address2cluster)
+    balance_change_dicts = chain.map_blocks(helper.DO_IT, start=start, end=end)
+    #flow_income_pairs = [helper.DO_IT(b) for b in chain[:max_block]]
+    
+    for balance_change_dict_and_fee in balance_change_dicts:
+        balance_change_dict = balance_change_dict_and_fee[0]
+        for cl_idx in balance_change_dict:
+            cluster_balances_np[cl_idx] += balance_change_dict[cl_idx]
+    return cluster_balances_np
+
+def getClustersBalanceChangeBlocksNonPar(chain, start, end, map_address2cluster, cluster_balances_np):
+    helper = getClustersBalanceChangeDict_classEdition(map_address2cluster)
+    #balance_change_dicts = chain.map_blocks(helper.DO_IT, start=start, end=end)
+    balance_change_dicts = [helper.DO_IT(b) for b in chain[start:end]]
+    
+    for balance_change_dict_and_fee in balance_change_dicts:
+        balance_change_dict = balance_change_dict_and_fee[0]
+        for cl_idx in balance_change_dict:
+            cluster_balances_np[cl_idx] += balance_change_dict[cl_idx]
+    return cluster_balances_np
+
+
+#Q_BALANCE_FLOW_TXCOUNT
+
+
+
+
+
+
 #Q_REL_FLOWS
 def getFlowAndIncomeVolumeForOneBlock(block, map_address2cluster):
     balance_deltas = collections.defaultdict(lambda: 0)
@@ -354,6 +448,8 @@ def aggregateByGroups(values, interval, agg_function=sum):
         aggregated.append(agg_function(values[i: i + interval]))
     return aggregated
 
+def g
+
 
 # Q_SAVE_READ
 import json
@@ -496,6 +592,7 @@ S_REL_FLOWS = 'relativeFlowVolumes'
 S_FEES = 'fees'
 S_REVENUES = 'revenues'
 S_UNSPENTS = 'unspents'
+S_NONEMPTY_CLS = 'nonEmptyClustersCounts'
 S_PRICES = 'prices'
 
 import time
@@ -505,7 +602,6 @@ def measure_time(f):
         f(*args, **kwargs)
         print('Work time {}s'.format(round(time.time() - start_time_allah_velik, 2)))
     return wrapper
-
 
 class CoinDataMgr:
     def __init__(self, blocksci_path, path_to_clusters, folder_with_calculated, max_block=None, group_size=1000):
@@ -538,6 +634,7 @@ class CoinDataMgr:
         self.d[S_FEES] = DataVersions(self.files_prefix, S_FEES)
         self.d[S_REVENUES] = DataVersions(self.files_prefix, S_REVENUES)
         self.d[S_UNSPENTS] = DataVersions(self.files_prefix, S_UNSPENTS)
+        self.d[S_NONEMPTY_CLS] = DataVersions(self.files_prefix, S_NONEMPTY_CLS)
         self.allMetrics = DataVersions(self.files_prefix, 'allMetrics', default_save_function=saveCSV,
                                                                         default_read_function=readCSV)
 
@@ -631,6 +728,20 @@ class CoinDataMgr:
             data[height] = None
 
         self.d[S_UNSPENTS].add(key, data)
+
+    @measure_time
+    def getNonEmptyClustersCounts(self, key='par'):
+        if key == 'par':
+            parrallel = True
+        elif key == 'nonPar':
+            parrallel = False
+        else:
+            raise None
+
+        data = getNonEmptyClustersCountsSoFar(self.chain, len(self.blocks), self.d[S_MAP_A2C].v['np'], self.group_size,
+            clusters_count=len(self.cl_mgr.clusters()), parrallel=parrallel)
+        self.d[S_NONEMPTY_CLS].add(key, data)
+
         
     def showDataAndVersions(self):
         for dataname in self.d:
@@ -673,7 +784,7 @@ class CoinDataMgr:
         return allMetrics_tag + tag_suffix
 
        
-    def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None, price_key=None):
+    def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None, prices_key=None):
         dict_to_draw = {}
         if not metric_version_dict is None:
             for metric in metric_version_dict:
@@ -688,7 +799,7 @@ class CoinDataMgr:
                     dict_to_draw[metric] = allMetrics_df[metric][begin:end]
             times = allMetrics_df['times'][begin:end]
 
-        subplots_count =  len(dict_to_draw) + (0 if price_key is None else 1)    
+        subplots_count =  len(dict_to_draw) + (0 if prices_key is None else 1)    
         if figsize is None:
             figsize = (20, 6 * subplots_count)
         #plt.locator_params(axis='x', nbins=10)
@@ -700,15 +811,15 @@ class CoinDataMgr:
             axes[ind, 0].plot(times, dict_to_draw[metric])
             axes[ind, 0].set_title(metric)
             ind += 1
-        if not price_key is None:
+        if not prices_key is None:
             axes[-1, 0].xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(10))
 
-            prices_df_00 = self.prices[price_key]
+            prices_df_00 = self.prices[prices_key]
             prices_df_0 = prices_df_00[pd.to_datetime(prices_df_00['times']) >= self.times[begin:][0]]
             prices_df =   prices_df_0 [pd.to_datetime(prices_df_0 ['times']) <= self.times[:end][-1]]
 
             axes[-1, 0].plot(pd.to_datetime(prices_df['times']), prices_df['prices'])
-            axes[-1, 0].set_title('prices from {}'.format(price_key))
+            axes[-1, 0].set_title('prices from {}'.format(prices_key))
 
         #axes[4].plot(pd.to_datetime(prices_half_b_df['snapped_at'])[b:e], prices_half_b_df['price'][b:e])
         #axes[4].set_title("Price (USD)")
