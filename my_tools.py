@@ -7,6 +7,7 @@ import numpy as np
 import datetime
 
 
+
 #Q_ANALYSIS
 
 S_REL_FLOWS = 'relativeFlowVolumes'
@@ -14,8 +15,86 @@ S_REL_FLOWS = 'relativeFlowVolumes'
 from sklearn.metrics import mean_squared_error
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.arima_model import ARIMA
+from statsmodels.tsa.api import VAR
 import statsmodels.api as sm
+import statsmodels
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
+
+
+def testStationarityTwice(series):
+    print('prob if stationary:', statsmodels.tsa.stattools.kpss(series)[1])
+    print('prob if NOT stationary:', adfuller(series)[1])
+
+def checkStationarities(df):
+    for col in df.columns:
+        if col != 'times':
+            print(col)
+            testStationarityTwice(df[col])
+
+def grangerCasualityNp(y, x, maxlag):
+    xy = pd.DataFrame({'x': x, 'y': y})
+    r = statsmodels.tsa.stattools.grangercausalitytests(xy[['y', 'x']], maxlag=maxlag, verbose=False)
+    result_np = np.zeros((maxlag + 1, 5))
+    for lag in range(1, maxlag + 1):
+        lag_r = r[lag]
+        p_values = [test_results[1] for test_results in lag_r[0].values()]
+        #print(list(lag_r[0].values()))
+        #p_values = [np.round(np.float(test_results[1]),5) for test_results in lag_r[0].values()]
+        result_np[lag][1:] = np.array(p_values).round(3)
+        result_np[lag][0] = (np.array(p_values).round(3)).max()
+    return result_np[1:]
+
+def todaYamamoto(y, x, maxlags=None, verbose=0):
+    xy = pd.DataFrame({'x': x, 'y': y})
+    model = VAR(xy)
+    if maxlags is None:
+        maxlags = model.select_order().selected_orders['aic']
+        if maxlags == 0:
+            maxlags = 1
+        #print('maxlags:', maxlags)
+        if verbose >= 3:
+            print('maxlags is', maxlags)
+    model_fit = model.fit(maxlags=maxlags)
+    lag = model_fit.k_ar
+    if verbose >= 2:
+        print('lag is', lag)
+    
+    if verbose >= 1:
+        print('x resids acorr p:', acorr_ljungbox(model_fit.resid['x'], lag)[1].max())
+        print('y resids acorr', acorr_ljungbox(model_fit.resid['y'], lag)[1].max())
+    
+    #print('lag:', lag)
+    if lag == 0:
+        print('lag was 0! Columns:', y.name, x.name)
+        lag = 1
+    x_not_cause_y = grangerCasualityNp(y, x, lag)[lag - 1][0]
+    y_not_cause_x = grangerCasualityNp(x, y, lag)[lag - 1][0]
+    if verbose >= 1:
+        print('x does NOT cause y:', x_not_cause_y)
+        print('y does NOT cause x:', y_not_cause_x)
+    return x_not_cause_y, y_not_cause_x
+
+def todaYamamotoWithCol(df, the_col, verbose=0):
+    for a_col in df.columns:
+        if not a_col in (the_col, 'times'):
+            print('y={},   x={}'.format(a_col, the_col))
+            todaYamamoto(df[a_col], df[the_col], verbose=verbose)
+            print('-------------------------------')
+
+def todaYamamotoDf(df, verbose=0):
+    ty_df = df.corr().copy()
+    for col in ty_df.columns:
+        for ind in ty_df.index:
+            if ind == col:
+                ty_df[col][ind] = None
+                continue
+            if verbose >= 1:
+                print('y={},   x={}'.format(col, ind))
+            ty_df[col][ind], ty_df[ind][col] = todaYamamoto(df[col], df[ind], verbose=verbose)
+            if verbose >= 1:
+                print('-------------------------------')
+    return ty_df
 
 def testStationarity(timeseries, plot=True):
     #Determing rolling statistics
@@ -132,9 +211,23 @@ def getMetricsCombinationsScores(df, metrics_list, arima_order):
     for r in range(1, len(metrics_list) + 1):
         for comb in itertools.combinations(metrics_list, r):
             columns = list(comb) + [S_REL_FLOWS]
-            res = ARIMAX_result(df.dropna()[columns], S_REL_FLOWS, arima_order=arima_order, plot=False)
-            rmses[createTag(comb)] = res
+            try:
+                res = ARIMAX_result(df.dropna()[columns], S_REL_FLOWS, arima_order=arima_order, plot=False)
+            except Exception as e:
+                print(createTag(comb), 'is failed')
+                print(e)
+            else:
+                rmses[createTag(comb)] = res
     return rmses
+
+def getMetricsAndPCombinationsScores(df, metrics_list, max_p=3):
+    rmses_p = {}
+    for p in range(max_p + 1):
+        rmses = getMetricsCombinationsScores(df, metrics_list, (p, 1, 1))
+        best_comb = [k for (k,v) in rmses.items() if v <= min(rmses.values())][0]
+        rmses_p[str(p)] = (best_comb, rmses[best_comb])
+        print('p = {} is done'.format(p))
+    return rmses_p
 
 def ARIMAX_PredictInSampleRMSE(df, endog_col, arima_order, plot=True):
     X = pd.DataFrame()
@@ -183,7 +276,7 @@ def arimaWalkForwardValidation(X, size, arima_order, plot=True):
     print('Test RMSE: %.4f' % rmse)
     return rmse
 
-def ARIMAX_WalkForwardValidation(df, endog_col, size, arima_order, plot=True, fuck_index=True):
+def ARIMAX_WalkForwardValidation(df, endog_col, size, arima_order, plot=True):
     #X = pd.DataFrame()
     #X.index = df.index
     #for col in df.columns:
@@ -200,15 +293,14 @@ def ARIMAX_WalkForwardValidation(df, endog_col, size, arima_order, plot=True, fu
     conf_1 = list()
     conf_2 = list()
     for t in range(len(y_test)):
-        if fuck_index:
-            model = sm.tsa.ARIMA(endog=y_history.values, exog=X_history.values, order=arima_order)
-        else:
-            model = sm.tsa.ARIMA(endog=y_history, exog=X_history, order=arima_order)
-        model_fit = model.fit(disp=False)
-        if fuck_index:
+        model = sm.tsa.ARIMA(endog=y_history.values, exog=X_history.values, order=arima_order)
+        try:
+            model_fit = model.fit(disp=False)
             yhat, _, conf_int  = model_fit.forecast(exog=X_history[-1:].values, alpha=0.1)
-        else:
-            yhat, _, conf_int = model_fit.forecast(exog=X_history[-1:], alpha=0.1)
+        except Exception as e:
+            print("step", t)
+            print(e)
+            yhat, conf_int = np.nan, [(np.nan, np.nan)]
         predictions.append(yhat)
         conf_1.append(conf_int[0][0])
         conf_2.append(conf_int[0][1])
@@ -227,7 +319,7 @@ def ARIMAX_WalkForwardValidation(df, endog_col, size, arima_order, plot=True, fu
     #rmse = np.sqrt(mean_squared_error(y_test, predictions))
     #print('Test RMSE: %.4f' % rmse)
     #return predictions, (conf_1, conf_2)
-    return {'predictions': predictions, 'conf_1': conf_1, 'conf_2': conf_2}
+    return {'predictions': predictions, 'conf_1': conf_1, 'conf_2': conf_2, 'index': y_test.index}
 
 def ARIMAX_result(df, endog_col, arima_order, plot=False, summary=False):
     X = df.copy()
@@ -1261,6 +1353,18 @@ S_DIFFS = 'blockDifficulties'
 S_SYNC_PRICES = 'synchronizedPrices'
 S_PRICES = 'prices'
 
+FOR_CHARTS = {
+    S_NCS: ('оц. коэффициента Накамото', 'майнеры'),
+    S_CLS_CNTS: ('лог. числа активных пользователей за период', ''),
+    S_GINIS: ('log(1 - g), g - коэф. Джини распределения валюты', ''),
+    S_FEES: ('лог. комиссии (в cатоши) за период', ''),
+    S_UNSPENTS: ('лог. объёма (в cатоши) непотраченных выходов периода', ''),
+    S_NONEMPTY_CLS: ('лог. суммарного числа пользователей', ''),
+    S_REL_FLOWS: (' лог. доли оборота валюты за период', '')
+}
+
+
+
 import time
 def measure_time(f):
     def wrapper(*args, **kwargs):
@@ -1495,8 +1599,120 @@ class CoinDataMgr:
         return allMetrics_tag + tag_suffix
 
        
+    def drawGraphTwinx(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None, prices_key=None,
+        vlines=[], prices_log=True, final=True):
+        dict_to_draw = {}
+        if not metric_version_dict is None:
+            for metric in metric_version_dict:
+                version = metric_version_dict[metric]
+                metric_and_version = metric + ('_' if version != '' else '') + version
+                dict_to_draw[metric_and_version] = self.d[metric].v[version][begin:end]
+            times = self.times[begin:end]
+        else:
+            allMetrics_df = self.allMetrics.v[allMetrics_tag]
+            for metric in allMetrics_df.columns:
+                if metric != 'times':
+                    dict_to_draw[metric] = allMetrics_df[metric][begin:end]
+            times = allMetrics_df['times'][begin:end]
+
+        def make_patch_spines_invisible(ax):
+            ax.set_frame_on(True)
+            ax.patch.set_visible(False)
+            for sp in ax.spines.values():
+                sp.set_visible(False)
+
+
+        subplots_count =  len(dict_to_draw) + (0 if prices_key is None else 1)    
+        if figsize is None:
+            figsize = (20, 7)
+        #plt.locator_params(axis='x', nbins=10)
+        f, host = plt.subplots()
+        f.set_size_inches(figsize)
+        #axes = f.subplots(subplots_count, 1, sharex=True, squeeze=False)
+        axes = [host.twinx() for i in range(subplots_count)]
+        colors = ['b','g','c','y','m','r', np.array((165,42,42))/256]
+        if prices_key is None:
+            colors = colors[3:]
+        #f.locator_params(axis='x', nbins=10)
+        tkw = dict(size=4, width=1.5)
+
+
+        ind = 0
+        for metric in dict_to_draw:
+
+            is_host = False
+            if not (prices_key is None and ind == subplots_count - 1):
+                axis = axes[ind]
+
+                axis.spines["right"].set_position(("axes", 1. + 0.04*ind))
+                make_patch_spines_invisible(axis)
+                axis.spines["right"].set_visible(True)
+            else:
+                axis = host
+                is_host = True
+
+            if final:
+                label = FOR_CHARTS[metric][0]
+            else:
+                label = metric
+
+            pl, = axis.plot(times, dict_to_draw[metric], color=colors[ind], label=label)
+
+            #axis.set_title(FOR_CHARTS[metric][0])
+            #axis.set_ylabel(FOR_CHARTS[metric][1])
+
+            for x in vlines:
+                if begin is None or begin < x:
+                    if end is None or x < end:
+                        axis.axvline(x=self.times[x], color='red')
+            ind += 1
+
+            axis.set_ylabel(label)
+            axis.yaxis.label.set_color(pl.get_color())
+            axis.tick_params(axis='y', colors=pl.get_color(), **tkw)
+
+        if not prices_key is None:
+            #axes[-1, 0].xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(10))
+
+            prices_df_00 = self.prices[prices_key]
+            prices_df_0 = prices_df_00[pd.to_datetime(prices_df_00['times']) >= self.times[begin:][0]]
+            prices_df =   prices_df_0 [pd.to_datetime(prices_df_0 ['times']) <= self.times[:end][-1]]
+
+            if prices_log:
+                prices_to_draw = np.log(prices_df['prices'])
+            else:
+                prices_to_draw = prices_df['prices']
+
+            pl, = host.plot(pd.to_datetime(prices_df['times']), prices_to_draw, color='k', label=label)
+            if final:
+                print('kutak!')
+                label = 'лог. рыночной цены (в USD)'
+                host.set_ylabel(label)
+                host.yaxis.label.set_color(pl.get_color())
+                host.tick_params(axis='y', colors=pl.get_color(), **tkw)
+            else:
+                axes[-1].set_title('prices from {}'.format(prices_key))
+
+
+
+            #axes[-1].spines["right"].set_position(("axes", 1. + 0.2*i))
+            #make_patch_spines_invisible(axes[-1])
+            #axes[-1].spines["right"].set_visible(True)
+
+            # brown color np.array((165,42,42))/256.
+            for x in vlines:
+                if begin is None or begin < x:
+                    if end is None or x < end:
+                        host.axvline(x=self.times[x], color='red')
+
+        f.legend()
+        #axes[4].plot(pd.to_datetime(prices_half_b_df['snapped_at'])[b:e], prices_half_b_df['price'][b:e])
+        #axes[4].set_title("Price (USD)")
+        return f
+
+
     def drawGraph(self, metric_version_dict=None, allMetrics_tag=None, figsize=None, begin=None, end=None, prices_key=None,
-        vlines=[], prices_log=True):
+        vlines=[], prices_log=True, final=True):
         dict_to_draw = {}
         if not metric_version_dict is None:
             for metric in metric_version_dict:
@@ -1521,10 +1737,15 @@ class CoinDataMgr:
         ind = 0
         for metric in dict_to_draw:
             axes[ind, 0].plot(times, dict_to_draw[metric])
-            axes[ind, 0].set_title(metric)
+            if final:
+                axes[ind, 0].set_title(FOR_CHARTS[metric][0])
+                axes[ind, 0].set_ylabel(FOR_CHARTS[metric][1])
+            else:
+                axes[ind, 0].set_title(metric)
             for x in vlines:
-                if begin < x < end:
-                    axes[ind, 0].axvline(x=self.times[x], color='red')
+                if begin is None or begin < x:
+                    if end is None or x < end:
+                        axes[ind, 0].axvline(x=self.times[x], color='red')
             ind += 1
         if not prices_key is None:
             #axes[-1, 0].xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(10))
@@ -1538,10 +1759,16 @@ class CoinDataMgr:
             else:
                 prices_to_draw = prices_df['prices']
             axes[-1, 0].plot(pd.to_datetime(prices_df['times']), prices_to_draw)
-            axes[-1, 0].set_title('prices from {}'.format(prices_key))
+            if final:
+                print('kutak!')
+                axes[-1, 0].set_title('лог. рыночной цены (в USD)')
+                axes[-1, 0].set_ylabel('')
+            else:
+                axes[-1, 0].set_title('prices from {}'.format(prices_key))
             for x in vlines:
-                if begin < x < end:
-                    axes[-1, 0].axvline(x=self.times[x], color='red')
+                if begin is None or begin < x:
+                    if end is None or x < end:
+                        axes[-1, 0].axvline(x=self.times[x], color='red')
 
 
         #axes[4].plot(pd.to_datetime(prices_half_b_df['snapped_at'])[b:e], prices_half_b_df['price'][b:e])
